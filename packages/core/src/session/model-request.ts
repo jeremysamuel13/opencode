@@ -222,7 +222,7 @@ export interface Interface {
   readonly primary: (input: Input) => Effect.Effect<Prepared<SessionContext>>
   readonly compaction: (input: Input) => Effect.Effect<Prepared<SessionCompaction>>
   readonly generate: (input: Input) => Effect.Effect<Prepared<SessionGenerate>>
-  readonly title: (input: Input) => Effect.Effect<Prepared<SessionTitle>>
+  readonly title: (input: Input & { readonly reason: SessionTitle["reason"] }) => Effect.Effect<Prepared<SessionTitle>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionModelRequest") {}
@@ -425,7 +425,8 @@ export const layer = Layer.effect(
       primary: (input) => prepare("primary", input, agentHook("context", input.agent)),
       compaction: (input) => prepare("compaction", input, agentHook("compaction", input.agent)),
       generate: (input) => prepare("generate", input, agentHook("generate", input.agent)),
-      title: (input) => prepare("title", input, (draft) => hooks.trigger("session", "title", draft)),
+      title: (input) =>
+        prepare("title", input, (draft) => hooks.trigger("session", "title", { ...draft, reason: input.reason })),
     })
   }),
 )

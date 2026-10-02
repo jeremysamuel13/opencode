@@ -63,6 +63,7 @@ describe("SessionModelRequest HTTP hooks", () => {
           model,
           system: [],
           messages: [],
+          reason: "regenerate",
         })
         const http = prepared.options.http
         if (!http) throw new Error(`Expected HTTP middleware for ${kind}`)

@@ -50,6 +50,8 @@ export interface SessionCompaction extends SessionContext {
 export interface SessionGenerate extends SessionContext {}
 
 export interface SessionTitle extends SessionRequest {
+  /** `initial` for a fresh session's first title; `regenerate` when an existing title is regenerated (`/rename` with no argument). */
+  readonly reason: "initial" | "regenerate"
   /** Set to use this title and skip the model request. */
   result?: string
 }
