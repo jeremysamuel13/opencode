@@ -24,6 +24,7 @@ import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Provider } from "@opencode/core/provider"
 import { Session } from "@opencode/core/session"
+import { SessionTitle } from "@opencode/core/session/title"
 import { PersistentPty } from "@opencode/core/persistent-pty"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -70,6 +71,12 @@ const permissionLayer = Layer.succeed(
   }),
 )
 
+/** Titles a plugin asks for; the real generator needs a model and belongs to the title tests. */
+export const generatedTitles: Session.ID[] = []
+const titleLayer = Layer.mock(SessionTitle.Service)({
+  generate: (sessionID) => Effect.sync(() => void generatedTitles.push(sessionID)),
+})
+
 export const makePluginTestLayer = (permission = permissionLayer) =>
   AppNodeBuilder.build(
     LayerNode.group([
@@ -97,6 +104,7 @@ export const makePluginTestLayer = (permission = permissionLayer) =>
       ManagedPolicy.node,
       Mcp.node,
       Session.node,
+      SessionTitle.node,
       PersistentPty.node,
       LocationServiceMap.node,
       Permission.node,
@@ -119,6 +127,7 @@ export const makePluginTestLayer = (permission = permissionLayer) =>
       Mcp.node.replace(emptyMcpLayer),
       Generate.node.replace(generateLayer),
       Permission.node.replace(permission),
+      SessionTitle.node.replace(titleLayer),
     ],
   ).pipe(Layer.provideMerge(configLayer))
 
