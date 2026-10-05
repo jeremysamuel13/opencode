@@ -123,6 +123,23 @@ await ctx.session.hook("retry", (event) => {
 })
 ```
 
+The title request is rendered from `history` (the first user message, then the
+context window) after hooks run, so reshape the history to shape the request, or
+assign `messages` to replace it. `@opencode/plugin/session-title` exports the
+renderer and its pieces for plugins that build their own request:
+
+```ts
+import { Message } from "@opencode/ai"
+import { render } from "@opencode/plugin/session-title"
+
+await ctx.session.hook("title", (event) => {
+  if (event.reason !== "regenerate") return
+  const history = event.history.filter((message) => message.type !== "compaction")
+  const text = render(history, { budget: event.budget, directory: event.directory })
+  event.messages = [Message.user(`${text}\n\nBranch: ${process.env.GIT_BRANCH ?? "unknown"}`)]
+})
+```
+
 Promise tools use complete executable tool values with async executors:
 
 ```ts

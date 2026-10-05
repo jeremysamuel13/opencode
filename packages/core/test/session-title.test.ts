@@ -34,7 +34,7 @@ import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
-import { Deferred, Effect, Fiber, Layer, Stream } from "effect"
+import { Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { testEffect } from "./lib/effect"
 
 let requests: LLMRequest[] = []
@@ -332,12 +332,21 @@ it.effect("falls back to the primary model when the small model fails", () =>
         attempted.push(event.model)
       }),
     )
+    const seen: number[] = []
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        seen.push(event.history.length)
+        event.history.length = 0
+      }),
+    )
 
     const title = yield* SessionTitle.Service
     yield* title.generate(sessionID)
 
     expect(requests.map((request) => String(request.model.id))).toEqual(["title-small", "title-model"])
     expect(attempted.map((model) => String(model.variant))).toEqual(["low", "high"])
+    // The fallback attempt starts from the session's history, not the first attempt's edits.
+    expect(seen).toEqual([1, 1])
     const store = yield* SessionStore.Service
     expect((yield* store.get(sessionID))?.title).toBe("Generated Title")
   }),
@@ -480,7 +489,12 @@ it.effect("bounds regeneration context while preserving the original request and
     const sessionID = Session.ID.make("ses_title_regenerate_bounded")
     yield* insertSession(sessionID, "Original title")
     yield* prompt(sessionID, `ORIGINAL_GOAL ${"a".repeat(3_000)} OMITTED_ORIGINAL_END`)
-    yield* prompt(sessionID, `OMITTED_OLD_CONTEXT ${"b".repeat(9_000)} RECENT_GOAL`)
+    yield* prompt(sessionID, `OMITTED_OLD_TURN ${"c".repeat(900)}`)
+    yield* Effect.forEach(
+      Array.from({ length: 12 }, (_, index) => `filler turn ${index} ${"d".repeat(900)}`),
+      (text) => prompt(sessionID, text),
+    )
+    yield* prompt(sessionID, `RECENT_ASK ${"b".repeat(3_000)} OMITTED_MIDDLE ${"b".repeat(3_000)} RECENT_GOAL`)
 
     const title = yield* SessionTitle.Service
     yield* title.generate(sessionID)
@@ -490,9 +504,408 @@ it.effect("bounds regeneration context while preserving the original request and
     if (content?.type !== "text") return
     expect(content.text.length).toBeLessThanOrEqual(8_000)
     expect(content.text).toContain("ORIGINAL_GOAL")
-    expect(content.text).toContain("RECENT_GOAL")
     expect(content.text).not.toContain("OMITTED_ORIGINAL_END")
-    expect(content.text).not.toContain("OMITTED_OLD_CONTEXT")
+    // A long turn keeps both ends: the ask before a pasted blob and the question after it.
+    expect(content.text).toContain("RECENT_ASK")
+    expect(content.text).toContain("RECENT_GOAL")
+    expect(content.text).not.toContain("OMITTED_MIDDLE")
+    // The oldest ask sits outside the retained window.
+    expect(content.text).not.toContain("OMITTED_OLD_TURN")
+  }),
+)
+
+it.effect("clips a long assistant reply on its own, keeping both ends", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_regenerate_assistant_clip")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Explain the parser")
+    const events = yield* Bus.Service
+    const assistantMessageID = SessionMessage.ID.create()
+    yield* events.publish(SessionEvent.Step.Started, {
+      sessionID,
+      assistantMessageID,
+      agent: Agent.ID.make("build"),
+      model: Model.Ref.make({ id: Model.ID.make("title-model"), providerID: Provider.ID.make("test") }),
+      started: 0,
+    })
+    yield* events.publish(SessionEvent.Text.Started, { sessionID, assistantMessageID, ordinal: 0 })
+    yield* events.publish(SessionEvent.Text.Ended, {
+      sessionID,
+      assistantMessageID,
+      ordinal: 0,
+      text: `REPLY_HEAD ${"e".repeat(2_000)} OMITTED_REPLY_MIDDLE ${"e".repeat(2_000)} REPLY_TAIL`,
+    })
+    yield* prompt(sessionID, "Thanks, now the lexer")
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    const content = requests[0]?.messages[0]?.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") return
+    const reply = content.text.match(/Assistant: .*/)?.[0] ?? ""
+    expect(reply.length).toBeLessThanOrEqual("Assistant: ".length + 600)
+    expect(reply).toContain("REPLY_HEAD")
+    expect(reply).toContain("REPLY_TAIL")
+    expect(reply).not.toContain("OMITTED_REPLY_MIDDLE")
+    expect(content.text).toContain("User: Thanks, now the lexer")
+  }),
+)
+
+it.effect("regeneration context names the tools and files touched", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_regenerate_activity")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster")
+    const events = yield* Bus.Service
+    const assistantMessageID = SessionMessage.ID.create()
+    yield* events.publish(SessionEvent.Step.Started, {
+      sessionID,
+      assistantMessageID,
+      agent: Agent.ID.make("build"),
+      model: Model.Ref.make({ id: Model.ID.make("title-model"), providerID: Provider.ID.make("test") }),
+      started: 0,
+    })
+    const call = (id: string, name: string, input: Record<string, unknown>, metadata?: Record<string, Schema.Json>) =>
+      Effect.gen(function* () {
+        yield* events.publish(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id, name })
+        yield* events.publish(SessionEvent.Tool.Called, { sessionID, assistantMessageID, id, input, executed: true })
+        yield* events.publish(SessionEvent.Tool.Success, {
+          sessionID,
+          assistantMessageID,
+          id,
+          content: [{ type: "text", text: "ok" }],
+          executed: true,
+          ...(metadata ? { metadata } : {}),
+        })
+      })
+    // v2 tools name the file in `path`; edit/write/patch also report what they changed in `metadata.files`.
+    yield* call("t0", "read", { path: "/project/README.md" })
+    yield* call("t1", "read", { path: "/project/src/parser.ts" })
+    yield* call("t2", "read", { path: "/project/src/parser.ts" })
+    yield* call(
+      "t3",
+      "edit",
+      { path: "/project/src/parser.ts", oldString: "a", newString: "b" },
+      { files: [{ file: "/project/src/parser.ts" }] },
+    )
+    yield* call(
+      "t4",
+      "patch",
+      { patchText: "*** Begin Patch" },
+      { files: [{ file: "/project/src/lexer.ts" }, { file: "/elsewhere/notes.md" }] },
+    )
+    yield* call("t5", "shell", { command: "bun test" })
+    // Persisted v1 sessions used `filePath`.
+    yield* call("t6", "edit", { filePath: "/project/src/legacy.ts" })
+    yield* Effect.forEach(
+      Array.from({ length: 10 }, (_, index) => index),
+      (index) => call(`extra-${index}`, "read", { path: `/project/src/extra-${index}.ts` }),
+    )
+    // A call still streaming its arguments has no input to name files from.
+    yield* events.publish(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id: "t7", name: "write" })
+    yield* events.publish(SessionEvent.Text.Started, { sessionID, assistantMessageID, ordinal: 20 })
+    yield* events.publish(SessionEvent.Text.Ended, { sessionID, assistantMessageID, ordinal: 20, text: "Done." })
+
+    const hooks = yield* PluginHooks.Service
+    const seen: string[] = []
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        expect(event.directory).toBe("/project")
+        const first = event.messages[0]?.content[0]
+        if (first?.type === "text") seen.push(first.text)
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    const content = requests[0]?.messages[0]?.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") return
+    // The hook saw the same request the model received.
+    expect(seen).toEqual([content.text])
+    expect(content.text).toContain("Tools used: read, edit, patch, shell, write")
+    expect(content.text).toContain(
+      "Files touched: README.md, src/parser.ts, src/lexer.ts, /elsewhere/notes.md, src/legacy.ts, src/extra-0.ts, src/extra-1.ts, src/extra-2.ts, src/extra-3.ts, src/extra-4.ts, src/extra-5.ts, src/extra-6.ts (+3 more)",
+    )
+    expect(content.text).not.toContain("oldString")
+    expect(content.text).not.toContain("patchText")
+  }),
+)
+
+it.effect("regeneration context carries a completed compaction summary", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_regenerate_summary")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster")
+    const events = yield* Bus.Service
+    yield* events.publish(SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "" })
+    yield* events.publish(SessionEvent.Compaction.Ended, {
+      sessionID,
+      reason: "manual",
+      text: "OLDER_SUMMARY",
+      recent: "",
+    })
+    yield* events.publish(SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "" })
+    yield* events.publish(SessionEvent.Compaction.Ended, {
+      sessionID,
+      reason: "manual",
+      text: "Parser was profiled; hot path is tokenize().",
+      recent: "",
+    })
+    yield* prompt(sessionID, "Now vectorize tokenize()")
+    // A compaction still running has nothing to contribute yet.
+    yield* events.publish(SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "" })
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    const content = requests[0]?.messages[0]?.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") return
+    expect(content.text).toContain("Original request:\nMake the parser faster")
+    expect(content.text).toContain("Summary of earlier conversation:\nParser was profiled; hot path is tokenize().")
+    expect(content.text).not.toContain("OLDER_SUMMARY")
+    expect(content.text).toContain("Recent conversation:\nUser: Now vectorize tokenize()")
+  }),
+)
+
+it.effect("clips a regenerated request that is only a long first message to the budget", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_budget_alone")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, `LONG_FIRST ${"a".repeat(9_000)}`)
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    const content = requests[0]?.messages[0]?.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") return
+    expect(content.text.startsWith("LONG_FIRST")).toBe(true)
+    expect(content.text.length).toBe(8_000)
+  }),
+)
+
+it.effect("clips the labelled sections and drops the turns when a hook shrinks the budget below them", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.budget = 40
+      }),
+    )
+    const sessionID = Session.ID.make("ses_title_budget_tight")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster than before")
+    yield* prompt(sessionID, "RECENT_TURN that must not appear")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    const content = requests[0]?.messages[0]?.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") return
+    expect(content.text.length).toBe(40)
+    expect(content.text.startsWith("Original request:\nMake the parser")).toBe(true)
+    expect(content.text).not.toContain("RECENT_TURN")
+  }),
+)
+
+it.effect("treats a non-finite budget as nothing to spend", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.budget = Infinity
+      }),
+    )
+    const sessionID = Session.ID.make("ses_title_budget_infinite")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster")
+    yield* prompt(sessionID, "RECENT_TURN")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({ type: "text", text: "" })
+  }),
+)
+
+it.effect("renders the title request from the history a hook reshaped", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_history_hook")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster")
+    yield* prompt(sessionID, "SECRET_TURN that must not reach the model")
+    yield* prompt(sessionID, "Now vectorize tokenize()")
+
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        expect(event.history.map((message) => message.type)).toEqual(["user", "user", "user"])
+        expect(event.messages[0]?.content[0]).toMatchObject({
+          type: "text",
+          text: expect.stringContaining("SECRET_TURN"),
+        })
+        event.history = event.history.filter((message) => message.type !== "user" || !message.text.includes("SECRET"))
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    const content = requests[0]?.messages[0]?.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") return
+    expect(content.text).toBe(
+      "Original request:\nMake the parser faster\n\nRecent conversation:\nUser: Now vectorize tokenize()",
+    )
+  }),
+)
+
+it.effect("keeps a title request whose messages a hook edited in place", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_spliced")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Secret: do not send")
+    yield* prompt(sessionID, "Follow-up")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages.splice(0, event.messages.length, Message.user("[redacted]"))
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({ type: "text", text: "[redacted]" })
+  }),
+)
+
+it.effect("sends no request text when a hook empties messages in place", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_emptied")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Secret: do not send")
+    yield* prompt(sessionID, "Follow-up")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages.length = 0
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(requests[0]?.messages).toEqual([])
+  }),
+)
+
+it.effect("keeps messages a hook assigned even when it also edits the history", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_assigned")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Keep this request")
+    yield* prompt(sessionID, "Follow-up")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages = [...event.messages]
+        event.history = []
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    const content = requests[0]?.messages[0]?.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") return
+    expect(content.text).toContain("Original request:\nKeep this request")
+  }),
+)
+
+it.effect("sends the initial title request as the bare first message", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_initial_bare")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Hello there")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({ type: "text", text: "Hello there" })
+  }),
+)
+
+it.effect("gives title hooks the initial request as a one-message history", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const hooks = yield* PluginHooks.Service
+    const histories: string[][] = []
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        histories.push(event.history.map((message) => message.type))
+      }),
+    )
+    const sessionID = Session.ID.make("ses_title_initial_history")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Hello again")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(histories).toEqual([["user"]])
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({ type: "text", text: "Hello again" })
+  }),
+)
+
+it.effect("holds an initial title request to a budget a hook set", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.budget = 60
+      }),
+    )
+    const sessionID = Session.ID.make("ses_title_initial_budget")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, `LONG_FIRST ${"a".repeat(10_000)}`)
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    const content = requests[0]?.messages[0]?.content[0]
+    expect(content?.type).toBe("text")
+    if (content?.type !== "text") return
+    expect(content.text.length).toBe(60)
+    expect(content.text.startsWith("LONG_FIRST")).toBe(true)
+  }),
+)
+
+it.effect("tells title hooks whether the title is initial or regenerated", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const reasons: string[] = []
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        reasons.push(event.reason)
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    const fresh = Session.ID.make("ses_title_reason_initial")
+    yield* insertSession(fresh)
+    yield* prompt(fresh, "Hello")
+    yield* title.generate(fresh)
+    const titled = Session.ID.make("ses_title_reason_regenerate")
+    yield* insertSession(titled, "Original title")
+    yield* prompt(titled, "Hello again")
+    yield* title.generate(titled)
+    expect(reasons).toEqual(["initial", "regenerate"])
   }),
 )
 

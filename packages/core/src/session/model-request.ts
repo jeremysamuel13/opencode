@@ -37,6 +37,7 @@ import { SessionProviderContext } from "./provider-context.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionSystemPrompt } from "./system-prompt.js"
+import { render } from "@opencode/plugin/session-title"
 import { toLLMMessages } from "./runner/to-llm-message.js"
 import type { SessionMessage } from "./message.js"
 
@@ -222,7 +223,9 @@ export interface Interface {
   readonly primary: (input: Input) => Effect.Effect<Prepared<SessionContext>>
   readonly compaction: (input: Input) => Effect.Effect<Prepared<SessionCompaction>>
   readonly generate: (input: Input) => Effect.Effect<Prepared<SessionGenerate>>
-  readonly title: (input: Input & { readonly reason: SessionTitle["reason"] }) => Effect.Effect<Prepared<SessionTitle>>
+  readonly title: (
+    input: Input & Pick<SessionTitle, "reason" | "history" | "budget">,
+  ) => Effect.Effect<Prepared<SessionTitle>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionModelRequest") {}
@@ -425,8 +428,29 @@ export const layer = Layer.effect(
       primary: (input) => prepare("primary", input, agentHook("context", input.agent)),
       compaction: (input) => prepare("compaction", input, agentHook("compaction", input.agent)),
       generate: (input) => prepare("generate", input, agentHook("generate", input.agent)),
-      title: (input) =>
-        prepare("title", input, (draft) => hooks.trigger("session", "title", { ...draft, reason: input.reason })),
+      // Hooks see the request rendered from `history`; afterwards it is rendered again
+      // from the history they left, unless a hook changed `messages` itself.
+      title: (input) => {
+        const directory = input.session.location.directory
+        const given = Message.user(render(input.history, { budget: input.budget, directory }))
+        return prepare("title", { ...input, messages: [given] }, (draft) =>
+          hooks
+            .trigger("session", "title", {
+              ...draft,
+              reason: input.reason,
+              history: input.history,
+              budget: input.budget,
+              directory,
+            })
+            .pipe(
+              Effect.map((event) =>
+                event.messages === draft.messages && event.messages.length === 1 && event.messages[0] === given
+                  ? { ...event, messages: [Message.user(render(event.history, { budget: event.budget, directory }))] }
+                  : event,
+              ),
+            ),
+        )
+      },
     })
   }),
 )

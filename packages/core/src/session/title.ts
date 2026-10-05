@@ -1,7 +1,7 @@
 export * as SessionTitle from "./title.js"
 
 import { isDeepStrictEqual } from "node:util"
-import { LLMClient, LLMEvent, Message, SystemPart } from "@opencode/ai"
+import { LLMClient, LLMEvent, SystemPart } from "@opencode/ai"
 import type { Agent } from "@opencode/schema/agent"
 import { Context, DateTime, Effect, Layer, Stream } from "effect"
 import { Database } from "../database/database.js"
@@ -14,12 +14,13 @@ import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
 import type { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
+import type { SessionMessage } from "@opencode/schema/session-message"
 import { SessionUsage } from "./usage.js"
 import { SessionStore } from "./store.js"
+import { BUDGET } from "@opencode/plugin/session-title"
+import type { SessionTitle as TitleHook } from "@opencode/plugin/promise/session"
 
 const MAX_LENGTH = 100
-const MAX_CONTEXT_LENGTH = 8_000
-const MAX_FIRST_MESSAGE_LENGTH = 2_000
 const titleChanged = Symbol("Session title changed")
 
 export interface Interface {
@@ -48,8 +49,9 @@ export const layer = Layer.effect(
     const attempt = Effect.fn("SessionTitle.attempt")(function* (input: {
       readonly session: SessionSchema.Info
       readonly agent: Agent.Info
-      readonly text: string
+      readonly history: ReadonlyArray<SessionMessage.Info>
       readonly model: SessionRunnerModel.Resolved
+      readonly reason: TitleHook["reason"]
     }) {
       const chunks: string[] = []
       let failed = false
@@ -68,7 +70,11 @@ export const layer = Layer.effect(
         agent: input.agent.id,
         model: input.model,
         system: input.agent.system ? [SystemPart.make(input.agent.system)] : [],
-        messages: [Message.user(input.text)],
+        messages: [],
+        reason: input.reason,
+        // Copied per attempt: hooks mutate it, and a fallback attempt must not see the first one's edits.
+        history: [...input.history],
+        budget: BUDGET,
       })
       if (prepared.event.result !== undefined) return prepared.event.result
       yield* llm.stream(prepared.request, prepared.options).pipe(
@@ -102,34 +108,21 @@ export const layer = Layer.effect(
       if (!session) return
       const firstUser = yield* SessionHistory.firstUserMessage(db, session.id)
       if (!firstUser) return
-      const text = !isUntitled(session)
-        ? yield* store.context(session.id).pipe(
-            Effect.map((messages) => {
-              const original = `Original request:\n${firstUser.text.slice(0, MAX_FIRST_MESSAGE_LENGTH)}`
-              const recent = messages
-                .flatMap((message) => {
-                  if (message.type === "user" && message.id !== firstUser.id) return [`User: ${message.text.trim()}`]
-                  if (message.type !== "assistant") return []
-                  const text = message.content
-                    .flatMap((part) => (part.type === "text" ? [part.text.trim()] : []))
-                    .filter(Boolean)
-                    .join("\n")
-                  return text ? [`Assistant: ${text}`] : []
-                })
-                .join("\n\n")
-              if (!recent) return original
-              const prefix = `${original}\n\nRecent conversation:\n`
-              return `${prefix}${recent.slice(-(MAX_CONTEXT_LENGTH - prefix.length))}`
-            }),
-            Effect.orElseSucceed(() => firstUser.text),
-          )
-        : firstUser.text
+      const reason = isUntitled(session) ? "initial" : "regenerate"
+      // The first user message anchors the topic; a compaction may have pushed it out of the context window.
+      const history =
+        reason === "regenerate"
+          ? yield* store.context(session.id).pipe(
+              Effect.map((messages) => [firstUser, ...messages.filter((message) => message.id !== firstUser.id)]),
+              Effect.orElseSucceed(() => [firstUser]),
+            )
+          : [firstUser]
       const selection = yield* context.selectTitle(session)
       if (!selection) return
       const title =
-        (yield* attempt({ session, agent: selection.agent, text, model: selection.selected })) ??
+        (yield* attempt({ session, agent: selection.agent, history, model: selection.selected, reason })) ??
         (selection.primary && !isDeepStrictEqual(selection.selected.ref, selection.primary.ref)
-          ? yield* attempt({ session, agent: selection.agent, text, model: selection.primary })
+          ? yield* attempt({ session, agent: selection.agent, history, model: selection.primary, reason })
           : undefined)
       if (!title) return
       const expectedSequence = (yield* Bus.latestSequence(db, sessionID)) + 1

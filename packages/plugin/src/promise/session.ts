@@ -52,6 +52,19 @@ export interface SessionGenerate extends SessionContext {}
 export interface SessionTitle extends SessionRequest {
   /** `initial` for a fresh session's first title; `regenerate` when an existing title is regenerated (`/rename` with no argument). */
   readonly reason: "initial" | "regenerate"
+  /**
+   * The session's first user message, then its context window. `messages` holds
+   * the request rendered from it (see `@opencode/plugin/session-title`) and is
+   * rendered again from the final `history` and `budget` once every hook has run,
+   * so filter or reorder `history` to shape the request. A hook that changes
+   * `messages` itself has the final say; earlier hooks' `history` edits are not
+   * reflected in `messages` until then.
+   */
+  history: Array<SessionMessage.Info>
+  /** Character budget of the rendered request. */
+  budget: number
+  /** The session's directory; `render` makes file paths relative to it. */
+  readonly directory: string
   /** Set to use this title and skip the model request. */
   result?: string
 }
