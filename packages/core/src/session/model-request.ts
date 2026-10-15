@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util"
 export * as SessionModelRequest from "./model-request.js"
 
 import {
@@ -36,6 +37,7 @@ import { SessionModelTransport } from "./model-transport.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionSystemPrompt } from "./system-prompt.js"
+import { render } from "@opencode/plugin/session-title"
 import { toLLMMessages } from "./runner/to-llm-message.js"
 import type { SessionMessage } from "./message.js"
 
@@ -215,7 +217,9 @@ export interface Interface {
   readonly primary: (input: Input) => Effect.Effect<Prepared<SessionContext>>
   readonly compaction: (input: Input) => Effect.Effect<Prepared<SessionCompaction>>
   readonly generate: (input: Input) => Effect.Effect<Prepared<SessionGenerate>>
-  readonly title: (input: Input) => Effect.Effect<Prepared<SessionTitle>>
+  readonly title: (
+    input: Omit<Input, "messages"> & Pick<SessionTitle, "reason" | "history">,
+  ) => Effect.Effect<Prepared<SessionTitle>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionModelRequest") {}
@@ -226,6 +230,10 @@ export const layer = Layer.effect(
     const hooks = yield* PluginHooks.Service
     const transport = yield* SessionModelTransport.Service
     const app = yield* App.Metadata
+    // No user message, no request: a hook that removed every one asked for no title.
+    const titleMessages = (history: SessionTitle["history"], reason: SessionTitle["reason"]) =>
+      history.some((message) => message.type === "user") ? [Message.user(render(history, reason))] : []
+
     const prepare = Effect.fn("SessionModelRequest.prepare")(function* <
       S extends SessionRequest & { tools?: Definitions },
     >(kind: SessionRequestKind, input: Input, shape: (draft: SessionRequest, tools: Definitions) => Effect.Effect<S>) {
@@ -404,7 +412,26 @@ export const layer = Layer.effect(
       primary: (input) => prepare("primary", input, agentHook("context", input.agent)),
       compaction: (input) => prepare("compaction", input, agentHook("compaction", input.agent)),
       generate: (input) => prepare("generate", input, agentHook("generate", input.agent)),
-      title: (input) => prepare("title", input, (draft) => hooks.trigger("session", "title", draft)),
+      // Hooks see the request rendered from `history`; afterwards it is rendered again
+      // from the history they left, unless a hook changed `messages` itself: replaced,
+      // spliced, or edited inside. `given` keeps the identities and `rendered` the values.
+      title: (input) => {
+        const given = titleMessages(input.history, input.reason)
+        const rendered = titleMessages(input.history, input.reason)
+        return prepare("title", { ...input, messages: [...given] }, (draft) =>
+          hooks
+            .trigger("session", "title", { ...draft, reason: input.reason, history: input.history })
+            .pipe(
+              Effect.map((event) =>
+                event.messages === draft.messages &&
+                given.every((message, index) => event.messages[index] === message) &&
+                isDeepStrictEqual(event.messages, rendered)
+                  ? { ...event, messages: titleMessages(event.history, event.reason) }
+                  : event,
+              ),
+            ),
+        )
+      },
     })
   }),
 )

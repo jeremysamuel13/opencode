@@ -4,6 +4,7 @@ import {
   LLMClient,
   LLMEvent,
   LanguageModel,
+  Media,
   Message,
   SystemPart,
   TransportError,
@@ -11,6 +12,8 @@ import {
 } from "@opencode/ai"
 import { OpenAIChat } from "@opencode/ai/protocols"
 import { Agent } from "@opencode/core/agent"
+import { render } from "@opencode/plugin/session-title"
+import type { Prompt } from "@opencode/schema/prompt"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { llmClient } from "@opencode/core/effect/app-node-platform"
@@ -20,7 +23,7 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
-import { SessionTable } from "@opencode/core/session/sql"
+import { SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { SessionTitle } from "@opencode/core/session/title"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
@@ -152,20 +155,41 @@ const insertSession = (id: Session.ID, title?: string, created?: number, model?:
       .pipe(Effect.orDie)
   })
 
-const prompt = (sessionID: Session.ID, text: string) =>
+const prompt = (sessionID: Session.ID, text: string, files?: Prompt["files"]) =>
   Effect.gen(function* () {
     const bus = yield* Bus.Service
     const messageID = SessionMessage.ID.create()
     yield* bus.publish(SessionEvent.InboxEnqueued, {
       sessionID,
       inboxID: messageID,
-      item: { type: "user", payload: { text }, delivery: "steer" },
+      item: { type: "user", payload: { text, files }, delivery: "steer" },
     })
     yield* bus.publish(SessionEvent.InboxDelivered, {
       sessionID,
       inboxID: messageID,
     })
   })
+
+const answer = (sessionID: Session.ID, text: string) =>
+  Effect.gen(function* () {
+    const bus = yield* Bus.Service
+    const assistantMessageID = SessionMessage.ID.create()
+    yield* bus.publish(SessionEvent.Step.Started, {
+      sessionID,
+      assistantMessageID,
+      agent: Agent.ID.make("build"),
+      model: Model.Ref.make({ providerID: Provider.ID.make("test"), id: Model.ID.make("title-model") }),
+      started: 0,
+    })
+    yield* bus.publish(SessionEvent.Text.Started, { sessionID, assistantMessageID, ordinal: 0 })
+    yield* bus.publish(SessionEvent.Text.Ended, { sessionID, assistantMessageID, ordinal: 0, text })
+  })
+
+const sent = () => requests.map((request) => request.messages.map(({ role, content }) => ({ role, content })))
+const asMessage = (text: string) =>
+  `Here is the first message of the conversation:\n\n<message>\n${text}\n</message>\n\nReply with only the title.`
+const asConversation = (text: string) =>
+  `Here is the conversation so far:\n\n<conversation>\n${text}\n</conversation>\n\nReply with only the title.`
 
 const small = Model.Info.make({
   ...Model.Info.default(Provider.ID.make("test"), Model.ID.make("title-small")),
@@ -563,6 +587,686 @@ it.effect("regenerates an existing title using the title agent", () =>
     expect(JSON.stringify(requests[0]?.messages)).toContain("Switch to fixing OAuth token refresh")
     expect(JSON.stringify(requests[0]?.messages)).not.toContain("Private reasoning that should not appear")
     expect((yield* store.get(sessionID))?.title).toBe("Generated Title")
+  }),
+)
+
+it.effect("renders the title request from the history a hook reshaped", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_history_hook")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster")
+    yield* prompt(sessionID, "SECRET_TURN that must not reach the model")
+    yield* prompt(sessionID, "Now vectorize tokenize()")
+
+    const hooks = yield* PluginHooks.Service
+    const given: unknown[] = []
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        given.push(
+          event.history.map((message) => message.type),
+          event.messages[0]?.content[0],
+        )
+        event.history = event.history.filter((message) => message.type !== "user" || !message.text.includes("SECRET"))
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(given).toEqual([
+      ["user", "user", "user"],
+      {
+        type: "text",
+        text: asConversation(
+          "Original request:\nMake the parser faster\n\nRecent conversation:\nUser: SECRET_TURN that must not reach the model\n\nUser: Now vectorize tokenize()",
+        ),
+      },
+    ])
+    expect(sent()).toEqual([
+      [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: asConversation(
+                "Original request:\nMake the parser faster\n\nRecent conversation:\nUser: Now vectorize tokenize()",
+              ),
+            },
+          ],
+        },
+      ],
+    ])
+  }),
+)
+
+it.effect("renders the title request from a history a hook reordered and edited in place", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_history_reordered")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "First")
+    yield* prompt(sessionID, "Second")
+    yield* prompt(sessionID, "Third")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.history.reverse()
+        event.history.splice(1, 1)
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    // The first user message in the reordered history anchors the request.
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({
+      type: "text",
+      text: asConversation("Original request:\nThird\n\nRecent conversation:\nUser: First"),
+    })
+  }),
+)
+
+it.effect("keeps a title request whose messages a hook edited in place", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_spliced")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Secret: do not send")
+    yield* prompt(sessionID, "Follow-up")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages.splice(0, event.messages.length, Message.user("[redacted]"))
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(sent()).toEqual([[{ role: "user", content: [{ type: "text", text: "[redacted]" }] }]])
+  }),
+)
+
+it.effect("keeps a message a hook pushed onto the title request", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_pushed")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Keep this request")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages.push(Message.user("Branch: main"))
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(requests[0]?.messages.map((message) => message.content[0])).toEqual([
+      { type: "text", text: asConversation("Original request:\nKeep this request") },
+      { type: "text", text: "Branch: main" },
+    ])
+  }),
+)
+
+it.effect("keeps a title request whose text a hook redacted inside the message", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_redacted")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Token SECRET_TOKEN leaked")
+    yield* prompt(sessionID, "Follow-up")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        const part = event.messages[0]?.content[0]
+        if (part?.type === "text") Object.assign(part, { text: part.text.replace("SECRET_TOKEN", "[redacted]") })
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(sent()).toEqual([
+      [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: asConversation(
+                "Original request:\nToken [redacted] leaked\n\nRecent conversation:\nUser: Follow-up",
+              ),
+            },
+          ],
+        },
+      ],
+    ])
+  }),
+)
+
+it.effect("keeps a message a hook replaced with an equal one inside the title request", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_equal")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Keep this request")
+    yield* prompt(sessionID, "Drop this turn")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages[0] = Message.user(event.messages[0]!.content)
+        event.history = event.history.slice(0, 1)
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    // A hook that changed messages has the final say, even with an equal value.
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({
+      type: "text",
+      text: asConversation("Original request:\nKeep this request\n\nRecent conversation:\nUser: Drop this turn"),
+    })
+  }),
+)
+
+it.effect("skips the title request when a hook empties messages in place", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_emptied")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Secret: do not send")
+    yield* prompt(sessionID, "Follow-up")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages.length = 0
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(requests).toEqual([])
+    const store = yield* SessionStore.Service
+    expect((yield* store.get(sessionID))?.title).toBe("Original title")
+  }),
+)
+
+it.effect("uses a hook-provided title even when the history has no user message left", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_result_over_empty")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Hello")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.history = []
+        event.result = "Hook title"
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(requests).toEqual([])
+    const store = yield* SessionStore.Service
+    expect((yield* store.get(sessionID))?.title).toBe("Hook title")
+  }),
+)
+
+it.effect("skips the title request when a hook empties the history", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_history_emptied")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Secret: do not send")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.history = []
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(requests).toEqual([])
+    const store = yield* SessionStore.Service
+    expect((yield* store.get(sessionID))?.title).toBe("Original title")
+  }),
+)
+
+it.effect("keeps messages a hook assigned even when it also edits the history", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_messages_assigned")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Keep this request")
+    yield* prompt(sessionID, "Follow-up")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages = [...event.messages]
+        event.history = []
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({
+      type: "text",
+      text: asConversation("Original request:\nKeep this request\n\nRecent conversation:\nUser: Follow-up"),
+    })
+  }),
+)
+
+it.effect("gives initial title hooks the whole history but sends only the first message", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const hooks = yield* PluginHooks.Service
+    const histories: string[][] = []
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        histories.push(event.history.map((message) => (message.type === "user" ? message.text : message.type)))
+      }),
+    )
+    const sessionID = Session.ID.make("ses_title_initial_history")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Hello again")
+    yield* prompt(sessionID, "And more")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(histories).toEqual([["Hello again", "And more"]])
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({ type: "text", text: asMessage("Hello again") })
+  }),
+)
+
+it.effect("still requests an initial title for a first prompt without text", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_image_only")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "", [{ mime: "image/png", data: "iVBORw0KGgo=", source: { type: "inline" } }])
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(sent()).toEqual([[{ role: "user", content: [{ type: "text", text: asMessage("") }] }]])
+  }),
+)
+
+it.effect("shows initial title hooks the first-message request, unlabelled", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const hooks = yield* PluginHooks.Service
+    const given: unknown[] = []
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        given.push(event.messages.map((message) => message.content))
+      }),
+    )
+    const sessionID = Session.ID.make("ses_title_initial_request")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Hello again")
+    yield* prompt(sessionID, "And more")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(given).toEqual([[[{ type: "text", text: asMessage("Hello again") }]]])
+  }),
+)
+
+it.effect("anchors an initial title on the first user message a hook left in the history", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_initial_reanchored")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "OLD_ANCHOR with a secret")
+    yield* prompt(sessionID, "New anchor")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.history = event.history.filter((message) => message.type !== "user" || !message.text.includes("OLD"))
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(sent()).toEqual([[{ role: "user", content: [{ type: "text", text: asMessage("New anchor") }] }]])
+  }),
+)
+
+it.effect("lets a later hook rebuild the request from an earlier hook's history", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_rebuild")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster")
+    yield* prompt(sessionID, "SECRET_TURN that must not reach the model")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.history = event.history.filter((message) => message.type !== "user" || !message.text.includes("SECRET"))
+      }),
+    )
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages = [Message.user(`Branch: main\n\n${render(event.history, event.reason)}`)]
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(sent()).toEqual([
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `Branch: main\n\n${asConversation("Original request:\nMake the parser faster")}` },
+          ],
+        },
+      ],
+    ])
+  }),
+)
+
+it.effect("tells title hooks a legacy fallback title is initial", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const reasons: string[] = []
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) => Effect.sync(() => void reasons.push(event.reason)))
+    const sessionID = Session.ID.make("ses_title_reason_legacy")
+    yield* insertSession(sessionID, "New session - 2026-07-30T18:45:03.662Z", Date.parse("2026-07-30T18:45:03.662Z"))
+    yield* prompt(sessionID, "Retry the legacy title")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(reasons).toEqual(["initial"])
+  }),
+)
+
+it.effect("tells title hooks an untitled session's title is initial", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const reasons: string[] = []
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) => Effect.sync(() => void reasons.push(event.reason)))
+    const sessionID = Session.ID.make("ses_title_reason_initial")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Hello")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(reasons).toEqual(["initial"])
+  }),
+)
+
+it.effect("tells title hooks a titled session's title is regenerated", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const reasons: string[] = []
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) => Effect.sync(() => void reasons.push(event.reason)))
+    const sessionID = Session.ID.make("ses_title_reason_regenerate")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Hello again")
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(reasons).toEqual(["regenerate"])
+  }),
+)
+
+it.effect("gives a fallback attempt the session history, not the first attempt's edits", () =>
+  Effect.gen(function* () {
+    titleStream = () =>
+      requests.length === 1
+        ? Stream.make(LLMEvent.providerError({ message: "Small model unavailable" }))
+        : successfulTitle()
+    selectedSmall = lowSmall
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_fallback_history")
+    yield* insertSession(
+      sessionID,
+      undefined,
+      undefined,
+      Model.Ref.make({
+        providerID: Provider.ID.make("test"),
+        id: Model.ID.make("title-model"),
+        variant: Model.VariantID.make("high"),
+      }),
+    )
+    yield* prompt(sessionID, "Fall back when title generation fails")
+    yield* prompt(sessionID, "Second turn")
+
+    const seen: number[] = []
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        seen.push(event.history.length)
+        event.history.length = 1
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(requests.map((request) => String(request.model.id))).toEqual(["title-small", "title-model"])
+    expect(seen).toEqual([2, 2])
+  }),
+)
+
+it.effect("sends a media-only request a hook assigned", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_media_only_request")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Hello")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.messages = [Message.user([Message.media(Media.base64("iVBORw0KGgo=", "image/png"))])]
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(sent().map((messages) => messages.map((message) => message.content.map((part) => part.type)))).toEqual([
+      [["media"]],
+    ])
+  }),
+)
+
+it.effect("skips the title request when a hook leaves only assistant turns in the history", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_assistant_only")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "First")
+    yield* answer(sessionID, "An answer")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.history = event.history.filter((message) => message.type === "assistant")
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+    expect(requests).toEqual([])
+    const store = yield* SessionStore.Service
+    expect((yield* store.get(sessionID))?.title).toBe("Original title")
+  }),
+)
+
+it.effect("does not try the fallback model when a hook set an empty title", () =>
+  Effect.gen(function* () {
+    selectedSmall = lowSmall
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_empty_result_no_fallback")
+    yield* insertSession(
+      sessionID,
+      "Original title",
+      undefined,
+      Model.Ref.make({
+        providerID: Provider.ID.make("test"),
+        id: Model.ID.make("title-model"),
+        variant: Model.VariantID.make("high"),
+      }),
+    )
+    yield* prompt(sessionID, "Hello")
+
+    const models: string[] = []
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        models.push(String(event.model.id))
+        event.result = ""
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(models).toEqual(["title-small"])
+    expect(requests).toEqual([])
+    const store = yield* SessionStore.Service
+    expect((yield* store.get(sessionID))?.title).toBe("Original title")
+  }),
+)
+
+it.effect("does not try the fallback model when a hook skipped the title", () =>
+  Effect.gen(function* () {
+    selectedSmall = lowSmall
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_skip_no_fallback")
+    yield* insertSession(
+      sessionID,
+      "Original title",
+      undefined,
+      Model.Ref.make({
+        providerID: Provider.ID.make("test"),
+        id: Model.ID.make("title-model"),
+        variant: Model.VariantID.make("high"),
+      }),
+    )
+    yield* prompt(sessionID, "Skip me on the small model")
+
+    const models: string[] = []
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        models.push(String(event.model.id))
+        if (event.model.id === small.id) event.history = []
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(models).toEqual(["title-small"])
+    expect(requests).toEqual([])
+  }),
+)
+
+it.effect("accepts the README title example: a plain message literal and a history without assistant turns", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_readme")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "First")
+    yield* answer(sessionID, "An answer")
+    yield* prompt(sessionID, "Second")
+
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.history = event.history.filter((message) => message.type !== "assistant")
+        if (event.reason === "regenerate")
+          event.messages = [
+            { role: "user", content: [{ type: "text", text: `Branch: main\n\n${render(event.history)}` }] },
+          ]
+      }),
+    )
+
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(sent()).toEqual([
+      [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Branch: main\n\n${asConversation("Original request:\nFirst\n\nRecent conversation:\nUser: Second")}`,
+            },
+          ],
+        },
+      ],
+    ])
+  }),
+)
+
+it.effect("gives title hooks the first user message and the context window as history", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_history_window")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster")
+    yield* prompt(sessionID, "A turn the compaction leaves behind")
+    const events = yield* Bus.Service
+    yield* events.publish(SessionEvent.Compaction.Started, { sessionID, reason: "manual" })
+    yield* events.publish(SessionEvent.Compaction.Ended, { sessionID, reason: "manual", text: "SUMMARY" })
+    yield* prompt(sessionID, "Now vectorize tokenize()")
+
+    const hooks = yield* PluginHooks.Service
+    const histories: string[][] = []
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        histories.push(event.history.map((message) => message.type))
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    // The window starts at the compaction; the first user message is put back in front of it.
+    expect(histories).toEqual([["user", "compaction", "user"]])
+    // The default request is unchanged: a compaction summary is there for hooks, not for the model.
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({
+      type: "text",
+      text: asConversation(
+        "Original request:\nMake the parser faster\n\nRecent conversation:\nUser: Now vectorize tokenize()",
+      ),
+    })
+  }),
+)
+
+it.effect("falls back to the first message alone when the context window cannot be read", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_history_unreadable")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Make the parser faster")
+    yield* prompt(sessionID, "A readable turn")
+    const { db } = yield* Database.Service
+    yield* db
+      .insert(SessionMessageTable)
+      .values({ id: SessionMessage.ID.create(), session_id: sessionID, type: "assistant", seq: 99, data: {} as never })
+      .run()
+      .pipe(Effect.orDie)
+
+    const hooks = yield* PluginHooks.Service
+    const histories: string[][] = []
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        histories.push(event.history.map((message) => message.type))
+      }),
+    )
+    const title = yield* SessionTitle.Service
+    yield* title.generate(sessionID)
+
+    expect(histories).toEqual([["user"]])
+    expect(requests[0]?.messages[0]?.content[0]).toEqual({
+      type: "text",
+      text: asConversation("Original request:\nMake the parser faster"),
+    })
   }),
 )
 

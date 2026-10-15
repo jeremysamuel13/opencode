@@ -51,6 +51,22 @@ export interface SessionCompaction extends SessionContext {
 export interface SessionGenerate extends SessionContext {}
 
 export interface SessionTitle extends SessionRequest {
+  /** `initial` while the session is still untitled; `regenerate` when an existing title is being replaced. */
+  readonly reason: "initial" | "regenerate"
+  /**
+   * The session's first user message, then its context window. `messages` holds
+   * the request rendered from it (see `@opencode/plugin/session-title`) and is
+   * rendered again from the final `history` once every hook has run, so filter
+   * or reorder `history` to shape the request. A hook that changes `messages`
+   * itself has the final say, and a `result` wins over both. An empty
+   * `messages` — what a history without a user message renders to — keeps the
+   * title as it is. `messages` is rendered once, before the first hook: a hook
+   * that edits it does not see earlier hooks' `history` edits unless it rebuilds
+   * the request with `render(event.history, event.reason)`. Likewise a hook that
+   * sends its own request reads `history` as of its turn, and the built-in
+   * provider plugins' hooks run before any other.
+   */
+  history: Array<SessionMessage.Info>
   /** Set to use this title and skip the model request. */
   result?: string
 }
