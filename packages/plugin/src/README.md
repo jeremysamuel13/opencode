@@ -123,6 +123,27 @@ await ctx.session.hook("retry", (event) => {
 })
 ```
 
+The title request is rendered from `history` (the first user message, then the
+context window) after hooks run, so reshape the history to shape the request, or
+assign `messages` to replace it. `reason` is `initial` while the session is still
+untitled and `regenerate` when an existing title is being replaced. The built-in
+provider plugins' hooks run first, so in a GitHub Copilot session a hook may find
+`result` already set to a title Copilot requested before any other hook could
+reshape the history. `@opencode/plugin/session-title` exports the renderer and
+its pieces for plugins that build their own request:
+
+```ts
+import { render } from "@opencode/plugin/session-title"
+
+await ctx.session.hook("title", (event) => {
+  // Title from what the user asked, not from what the assistant answered.
+  event.history = event.history.filter((message) => message.type !== "assistant")
+  // Or build the request yourself; a hook that sets `messages` has the final say.
+  if (event.reason === "regenerate")
+    event.messages = [{ role: "user", content: [{ type: "text", text: `${render(event.history)}\n\nBranch: main` }] }]
+})
+```
+
 Promise tools use complete executable tool values with async executors:
 
 ```ts

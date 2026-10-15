@@ -1,7 +1,7 @@
 export * as SessionTitle from "./title.js"
 
 import { isDeepStrictEqual } from "node:util"
-import { LLMClient, LLMEvent, Message, SystemPart } from "@opencode/ai"
+import { LLMClient, LLMEvent, SystemPart } from "@opencode/ai"
 import type { Agent } from "@opencode/schema/agent"
 import { Context, DateTime, Effect, Layer, Stream } from "effect"
 import { Database } from "../database/database.js"
@@ -16,10 +16,9 @@ import type { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionUsage } from "./usage.js"
 import { SessionStore } from "./store.js"
+import type { History, Reason } from "@opencode/plugin/session-title"
 
 const MAX_LENGTH = 100
-const MAX_CONTEXT_LENGTH = 8_000
-const MAX_FIRST_MESSAGE_LENGTH = 2_000
 const titleChanged = Symbol("Session title changed")
 
 export interface Interface {
@@ -48,8 +47,9 @@ export const layer = Layer.effect(
     const attempt = Effect.fn("SessionTitle.attempt")(function* (input: {
       readonly session: SessionSchema.Info
       readonly agent: Agent.Info
-      readonly text: string
+      readonly history: History
       readonly model: SessionRunnerModel.Resolved
+      readonly reason: Reason
     }) {
       const chunks: string[] = []
       let failed = false
@@ -68,9 +68,13 @@ export const layer = Layer.effect(
         agent: input.agent.id,
         model: input.model,
         system: input.agent.system ? [SystemPart.make(input.agent.system)] : [],
-        messages: [Message.user(input.text)],
+        reason: input.reason,
+        // Copied per attempt: hooks filter and reorder it in place, and a fallback attempt starts from the session's history.
+        history: [...input.history],
       })
       if (prepared.event.result !== undefined) return prepared.event.result
+      // An empty request is a skip: like an empty result, it keeps the title and tries no other model.
+      if (prepared.event.messages.length === 0) return ""
       yield* llm.stream(prepared.request, prepared.options).pipe(
         Stream.runForEach((event) => {
           if (LLMEvent.is.providerError(event)) failed = true
@@ -102,34 +106,20 @@ export const layer = Layer.effect(
       if (!session) return
       const firstUser = yield* SessionHistory.firstUserMessage(db, session.id)
       if (!firstUser) return
-      const text = !isUntitled(session)
-        ? yield* store.context(session.id).pipe(
-            Effect.map((messages) => {
-              const original = `Original request:\n${firstUser.text.slice(0, MAX_FIRST_MESSAGE_LENGTH)}`
-              const recent = messages
-                .flatMap((message) => {
-                  if (message.type === "user" && message.id !== firstUser.id) return [`User: ${message.text.trim()}`]
-                  if (message.type !== "assistant") return []
-                  const text = message.content
-                    .flatMap((part) => (part.type === "text" ? [part.text.trim()] : []))
-                    .filter(Boolean)
-                    .join("\n")
-                  return text ? [`Assistant: ${text}`] : []
-                })
-                .join("\n\n")
-              if (!recent) return original
-              const prefix = `${original}\n\nRecent conversation:\n`
-              return `${prefix}${recent.slice(-(MAX_CONTEXT_LENGTH - prefix.length))}`
-            }),
-            Effect.orElseSucceed(() => firstUser.text),
-          )
-        : firstUser.text
+      // Selected before the window is read: a session with no title agent should not decode its history.
       const selection = yield* context.selectTitle(session)
       if (!selection) return
+      const reason = isUntitled(session) ? "initial" : "regenerate"
+      // The first user message anchors the topic; a compaction may have pushed it out of the context window.
+      const history = yield* store.context(session.id).pipe(
+        Effect.map((messages) => [firstUser, ...messages.filter((message) => message.id !== firstUser.id)]),
+        Effect.tapError((error) => Effect.logDebug("title history unavailable, using the first message", { error })),
+        Effect.orElseSucceed(() => [firstUser]),
+      )
       const title =
-        (yield* attempt({ session, agent: selection.agent, text, model: selection.selected })) ??
+        (yield* attempt({ session, agent: selection.agent, history, model: selection.selected, reason })) ??
         (selection.primary && !isDeepStrictEqual(selection.selected.ref, selection.primary.ref)
-          ? yield* attempt({ session, agent: selection.agent, text, model: selection.primary })
+          ? yield* attempt({ session, agent: selection.agent, history, model: selection.primary, reason })
           : undefined)
       if (!title) return
       const expectedSequence = (yield* Bus.latestSequence(db, sessionID)) + 1
